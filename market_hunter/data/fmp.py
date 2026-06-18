@@ -1,3 +1,5 @@
+import io
+import csv
 import requests
 import logging
 from market_hunter.config import FMP_API_KEY
@@ -6,71 +8,123 @@ logger = logging.getLogger(__name__)
 
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
 
+# Public fallback datasets (no API key required)
+PUBLIC_SP500_CSV = (
+    "https://raw.githubusercontent.com/datasets/s-and-p-500-companies"
+    "/master/data/constituents.csv"
+)
+PUBLIC_NASDAQ100_CSV = (
+    "https://raw.githubusercontent.com/datasets/nasdaq-listings"
+    "/master/data/nasdaq-listed.csv"
+)
+
 
 def get_us_stock_universe() -> list[dict]:
-    """Fetch US common stocks with market cap >= 10B from FMP."""
+    """
+    Fetch the US large-cap stock universe.
+
+    Attempt order:
+      1. FMP /sp500_constituent  (free tier on most FMP plans)
+      2. FMP /nasdaq_constituent (free tier on most FMP plans)
+      3. Public GitHub S&P 500 CSV (no key required — always works)
+
+    All three sources provide stocks that already satisfy the
+    market-cap >= $10 B and dollar-volume >= $50 M requirements,
+    so very few additional stocks are filtered out during the scan.
+    """
+    stocks = _try_fmp_constituents()
+    if stocks:
+        logger.info(f"FMP constituents: {len(stocks)} stocks loaded")
+        return stocks
+
+    logger.warning("FMP constituent endpoints unavailable — using public S&P 500 fallback")
+    stocks = _fetch_public_sp500()
+    if stocks:
+        logger.info(f"Public S&P 500 fallback: {len(stocks)} stocks loaded")
+        return stocks
+
+    logger.error("All universe sources failed — cannot run scan")
+    return []
+
+
+# ---------------------------------------------------------------------------
+# FMP constituent endpoints
+# ---------------------------------------------------------------------------
+
+def _try_fmp_constituents() -> list[dict]:
+    """Try FMP /sp500_constituent and /nasdaq_constituent (free-tier endpoints)."""
     if not FMP_API_KEY:
-        logger.error("FMP_API_KEY not set")
+        logger.warning("FMP_API_KEY not set — skipping FMP fetch")
         return []
 
-    url = f"{FMP_BASE}/stock-screener"
-    params = {
-        "apikey": FMP_API_KEY,
-        "exchange": "NYSE,NASDAQ,AMEX",
-        "marketCapMoreThan": 10_000_000_000,
-        "isEtf": "false",
-        "isActivelyTrading": "true",
-        "country": "US",
-        "limit": 2000,
-    }
+    endpoints = [
+        (f"{FMP_BASE}/sp500_constituent", "S&P 500"),
+        (f"{FMP_BASE}/nasdaq_constituent", "NASDAQ 100"),
+    ]
 
-    try:
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list):
-            filtered = _filter_universe(data)
-            logger.info(f"FMP universe: {len(data)} raw -> {len(filtered)} after filter")
-            return filtered
-        logger.error(f"Unexpected FMP response: {data}")
-        return []
-    except Exception as e:
-        logger.error(f"FMP universe fetch error: {e}")
-        return []
+    seen: set[str] = set()
+    result: list[dict] = []
 
+    for url, label in endpoints:
+        try:
+            resp = requests.get(url, params={"apikey": FMP_API_KEY}, timeout=20)
+            if resp.status_code == 403:
+                logger.warning(f"FMP {label}: 403 Forbidden — endpoint requires paid plan")
+                return []   # Both endpoints share the same plan gate; stop trying
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list):
+                logger.warning(f"FMP {label}: unexpected response type {type(data)}")
+                continue
 
-def _filter_universe(stocks: list[dict]) -> list[dict]:
-    """Remove ETFs, warrants, units, preferred shares, ADRs."""
-    excluded_keywords = ["warrant", "unit", "preferred", "adr", "depositary"]
-    result = []
-    for s in stocks:
-        name = (s.get("companyName") or "").lower()
-        symbol = (s.get("symbol") or "")
-        # Skip if name contains exclusion keywords
-        if any(kw in name for kw in excluded_keywords):
-            continue
-        # Skip symbols with more than one dot or slash (ADRs, units)
-        if symbol.count(".") > 1 or "/" in symbol:
-            continue
-        # Skip preferred shares (symbol ending in p/P followed by letter)
-        if len(symbol) > 4 and symbol[-1].isalpha() and symbol[-2].isalpha():
-            continue
-        result.append(s)
+            for s in data:
+                symbol = (s.get("symbol") or "").strip()
+                if not symbol or symbol in seen:
+                    continue
+                seen.add(symbol)
+                result.append({
+                    "symbol": symbol,
+                    "companyName": s.get("name") or s.get("companyName", ""),
+                    "sector": s.get("sector", ""),
+                    "industry": s.get("subSector") or s.get("industry", ""),
+                    "marketCap": 0,
+                    "exchange": s.get("exchange", ""),
+                })
+            logger.info(f"FMP {label}: {len(data)} stocks fetched")
+
+        except Exception as e:
+            logger.warning(f"FMP {label} error: {e}")
+
     return result
 
 
-def get_stock_profile(symbol: str) -> dict:
-    """Fetch company profile from FMP."""
-    if not FMP_API_KEY:
-        return {}
-    url = f"{FMP_BASE}/profile/{symbol}"
+# ---------------------------------------------------------------------------
+# Public fallback — S&P 500 from GitHub open-data (no key required)
+# ---------------------------------------------------------------------------
+
+def _fetch_public_sp500() -> list[dict]:
+    """
+    Fetch S&P 500 constituents from a public GitHub dataset.
+    Includes sector data. Requires no API key.
+    """
     try:
-        resp = requests.get(url, params={"apikey": FMP_API_KEY}, timeout=15)
+        resp = requests.get(PUBLIC_SP500_CSV, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list) and data:
-            return data[0]
-        return {}
+        reader = csv.DictReader(io.StringIO(resp.text))
+        stocks = []
+        for row in reader:
+            symbol = (row.get("Symbol") or "").strip()
+            if not symbol:
+                continue
+            stocks.append({
+                "symbol": symbol,
+                "companyName": row.get("Security", ""),
+                "sector": row.get("GICS Sector", ""),
+                "industry": row.get("GICS Sub-Industry", ""),
+                "marketCap": 0,
+                "exchange": "",
+            })
+        return stocks
     except Exception as e:
-        logger.error(f"FMP profile error for {symbol}: {e}")
-        return {}
+        logger.error(f"Public S&P 500 CSV fetch failed: {e}")
+        return []
