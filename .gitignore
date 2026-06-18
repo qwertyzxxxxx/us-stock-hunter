@@ -47,3 +47,23 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# Secrets
+.env
+.env.*
+
+# market-hunter runtime data
+*.db
+market_hunter.db
+logs/
