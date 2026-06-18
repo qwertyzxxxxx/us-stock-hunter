@@ -130,7 +130,7 @@ def run_us_scan(notify: bool = True) -> dict:
 
     def _save_signals(signals, strategy_name):
         for rank, sig in enumerate(signals, 1):
-            sig_id = db.insert_signal(run_id, sig)
+            sig_id = db.upsert_signal(run_id, sig)
             db.insert_strategy_result(
                 sig_id, strategy_name, sig["symbol"], scan_date, rank,
                 str(sig.get("strategy_details", {}))
@@ -140,7 +140,7 @@ def run_us_scan(notify: bool = True) -> dict:
     _save_signals(top_strong, "strong_trend")
     _save_signals(top_new_high, "new_high")
     for rank, sig in enumerate(top20, 1):
-        db.insert_signal(run_id, sig)
+        db.upsert_signal(run_id, sig)
 
     results = {
         "scan_date": scan_date,

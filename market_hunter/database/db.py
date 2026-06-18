@@ -13,7 +13,7 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db():
-    """Create all tables if they don't exist."""
+    """Create all tables and unique indexes if they don't exist."""
     conn = get_conn()
     cur = conn.cursor()
 
@@ -80,6 +80,23 @@ def init_db():
     );
     """)
     conn.commit()
+
+    # Unique indexes — prevent duplicate signals on reruns.
+    # Each symbol may only have one signal row per calendar day.
+    # Each symbol may only have one strategy_result row per strategy per day.
+    # Wrapped individually so a pre-existing duplicate won't block the other index.
+    for ddl in [
+        """CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_symbol_date
+           ON signals(symbol, signal_date)""",
+        """CREATE UNIQUE INDEX IF NOT EXISTS ux_strategy_results_symbol_strategy_date
+           ON strategy_results(symbol, strategy_name, signal_date)""",
+    ]:
+        try:
+            cur.execute(ddl)
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            logger.warning(f"Could not create unique index (existing duplicates?): {e}")
+
     conn.close()
     logger.info("Database initialized")
 
@@ -99,11 +116,16 @@ def insert_scan_run(run_date: str, total_scanned: int, total_signals: int,
     return run_id
 
 
-def insert_signal(scan_run_id: int, signal: dict) -> int:
+def upsert_signal(scan_run_id: int, signal: dict) -> int:
+    """
+    Insert a signal row for (symbol, signal_date).
+    If the row already exists (same-day rerun), skip the insert and return
+    the existing row's id. The existing record is left unchanged.
+    """
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO signals
+        """INSERT OR IGNORE INTO signals
            (scan_run_id, symbol, company_name, sector, industry, market_cap, signal_date,
             close_price, volume, trend_score, relative_strength_score, volume_score,
             pullback_risk_score, sector_score, total_score, strategies)
@@ -127,21 +149,46 @@ def insert_signal(scan_run_id: int, signal: dict) -> int:
             ",".join(signal.get("strategies", [])),
         )
     )
-    signal_id = cur.lastrowid
     conn.commit()
+
+    if cur.lastrowid:
+        signal_id = cur.lastrowid
+    else:
+        # Row was ignored — fetch the id of the existing record
+        cur.execute(
+            "SELECT id FROM signals WHERE symbol=? AND signal_date=?",
+            (signal.get("symbol"), signal.get("signal_date")),
+        )
+        row = cur.fetchone()
+        signal_id = row["id"] if row else 0
+        logger.debug(
+            f"Signal already exists for {signal.get('symbol')} on "
+            f"{signal.get('signal_date')} — skipped insert, using id={signal_id}"
+        )
+
     conn.close()
     return signal_id
 
 
 def insert_strategy_result(signal_id: int, strategy_name: str, symbol: str,
                             signal_date: str, rank: int, details: str = ""):
+    """
+    Insert a strategy_result row. Silently skipped if the same
+    (symbol, strategy_name, signal_date) already exists.
+    """
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO strategy_results (signal_id, strategy_name, symbol, signal_date, rank_in_strategy, details)
+        """INSERT OR IGNORE INTO strategy_results
+           (signal_id, strategy_name, symbol, signal_date, rank_in_strategy, details)
            VALUES (?,?,?,?,?,?)""",
         (signal_id, strategy_name, symbol, signal_date, rank, details)
     )
+    if cur.rowcount == 0:
+        logger.debug(
+            f"strategy_result already exists for {symbol} / {strategy_name} "
+            f"on {signal_date} — skipped"
+        )
     conn.commit()
     conn.close()
 
