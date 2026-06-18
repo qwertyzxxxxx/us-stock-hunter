@@ -1,0 +1,217 @@
+import sqlite3
+import logging
+from datetime import datetime
+from market_hunter.config import DB_PATH
+
+logger = logging.getLogger(__name__)
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """Create all tables if they don't exist."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS scan_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_date TEXT NOT NULL,
+        market TEXT NOT NULL DEFAULT 'US',
+        total_scanned INTEGER,
+        total_signals INTEGER,
+        duration_seconds REAL,
+        status TEXT DEFAULT 'completed',
+        error TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_run_id INTEGER REFERENCES scan_runs(id),
+        symbol TEXT NOT NULL,
+        company_name TEXT,
+        sector TEXT,
+        industry TEXT,
+        market_cap REAL,
+        signal_date TEXT NOT NULL,
+        close_price REAL,
+        volume REAL,
+        trend_score REAL,
+        relative_strength_score REAL,
+        volume_score REAL,
+        pullback_risk_score REAL,
+        sector_score REAL,
+        total_score REAL,
+        strategies TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS strategy_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id INTEGER REFERENCES signals(id),
+        strategy_name TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        signal_date TEXT NOT NULL,
+        rank_in_strategy INTEGER,
+        details TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS evaluations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id INTEGER REFERENCES signals(id),
+        symbol TEXT NOT NULL,
+        signal_date TEXT NOT NULL,
+        signal_price REAL,
+        eval_date_5d TEXT,
+        return_5d REAL,
+        eval_date_10d TEXT,
+        return_10d REAL,
+        eval_date_20d TEXT,
+        return_20d REAL,
+        max_drawdown REAL,
+        max_gain REAL,
+        evaluated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized")
+
+
+def insert_scan_run(run_date: str, total_scanned: int, total_signals: int,
+                    duration: float, status: str = "completed", error: str = None) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO scan_runs (run_date, market, total_scanned, total_signals, duration_seconds, status, error)
+           VALUES (?, 'US', ?, ?, ?, ?, ?)""",
+        (run_date, total_scanned, total_signals, duration, status, error)
+    )
+    run_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return run_id
+
+
+def insert_signal(scan_run_id: int, signal: dict) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO signals
+           (scan_run_id, symbol, company_name, sector, industry, market_cap, signal_date,
+            close_price, volume, trend_score, relative_strength_score, volume_score,
+            pullback_risk_score, sector_score, total_score, strategies)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            scan_run_id,
+            signal.get("symbol"),
+            signal.get("company_name"),
+            signal.get("sector"),
+            signal.get("industry"),
+            signal.get("market_cap"),
+            signal.get("signal_date"),
+            signal.get("close_price"),
+            signal.get("volume"),
+            signal.get("trend_score"),
+            signal.get("relative_strength_score"),
+            signal.get("volume_score"),
+            signal.get("pullback_risk_score"),
+            signal.get("sector_score"),
+            signal.get("total_score"),
+            ",".join(signal.get("strategies", [])),
+        )
+    )
+    signal_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return signal_id
+
+
+def insert_strategy_result(signal_id: int, strategy_name: str, symbol: str,
+                            signal_date: str, rank: int, details: str = ""):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO strategy_results (signal_id, strategy_name, symbol, signal_date, rank_in_strategy, details)
+           VALUES (?,?,?,?,?,?)""",
+        (signal_id, strategy_name, symbol, signal_date, rank, details)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_unevaluated_signals(days_old_min: int = 5) -> list[dict]:
+    """Get signals that haven't been evaluated yet and are old enough."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT s.id, s.symbol, s.signal_date, s.close_price
+           FROM signals s
+           LEFT JOIN evaluations e ON e.signal_id = s.id
+           WHERE e.id IS NULL
+             AND julianday('now') - julianday(s.signal_date) >= ?
+           ORDER BY s.signal_date ASC""",
+        (days_old_min,)
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def insert_evaluation(signal_id: int, eval_data: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO evaluations
+           (signal_id, symbol, signal_date, signal_price,
+            eval_date_5d, return_5d, eval_date_10d, return_10d,
+            eval_date_20d, return_20d, max_drawdown, max_gain)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            signal_id,
+            eval_data.get("symbol"),
+            eval_data.get("signal_date"),
+            eval_data.get("signal_price"),
+            eval_data.get("eval_date_5d"),
+            eval_data.get("return_5d"),
+            eval_data.get("eval_date_10d"),
+            eval_data.get("return_10d"),
+            eval_data.get("eval_date_20d"),
+            eval_data.get("return_20d"),
+            eval_data.get("max_drawdown"),
+            eval_data.get("max_gain"),
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_signals(limit: int = 100) -> list[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT s.*, e.return_5d, e.return_10d, e.return_20d, e.max_drawdown, e.max_gain
+           FROM signals s
+           LEFT JOIN evaluations e ON e.signal_id = s.id
+           ORDER BY s.signal_date DESC, s.total_score DESC
+           LIMIT ?""",
+        (limit,)
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_scan_runs(limit: int = 20) -> list[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM scan_runs ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
