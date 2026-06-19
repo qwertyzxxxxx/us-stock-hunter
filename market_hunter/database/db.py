@@ -1,6 +1,6 @@
+import json
 import sqlite3
 import logging
-from datetime import datetime
 from market_hunter.config import DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -13,7 +13,7 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db():
-    """Create all tables and unique indexes if they don't exist."""
+    """Create all tables, unique indexes, and run column migrations."""
     conn = get_conn()
     cur = conn.cursor()
 
@@ -23,6 +23,8 @@ def init_db():
         run_date TEXT NOT NULL,
         market TEXT NOT NULL DEFAULT 'US',
         total_scanned INTEGER,
+        valid_price_count INTEGER,
+        rejected_bad_price_count INTEGER,
         total_signals INTEGER,
         duration_seconds REAL,
         status TEXT DEFAULT 'completed',
@@ -48,6 +50,7 @@ def init_db():
         sector_score REAL,
         total_score REAL,
         strategies TEXT,
+        diagnostics TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -59,6 +62,7 @@ def init_db():
         signal_date TEXT NOT NULL,
         rank_in_strategy INTEGER,
         details TEXT,
+        reason TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -81,10 +85,7 @@ def init_db():
     """)
     conn.commit()
 
-    # Unique indexes — prevent duplicate signals on reruns.
-    # Each symbol may only have one signal row per calendar day.
-    # Each symbol may only have one strategy_result row per strategy per day.
-    # Wrapped individually so a pre-existing duplicate won't block the other index.
+    # Unique indexes
     for ddl in [
         """CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_symbol_date
            ON signals(symbol, signal_date)""",
@@ -95,20 +96,41 @@ def init_db():
             cur.execute(ddl)
             conn.commit()
         except sqlite3.OperationalError as e:
-            logger.warning(f"Could not create unique index (existing duplicates?): {e}")
+            logger.warning(f"Could not create unique index: {e}")
+
+    # Column migrations — add columns that may be missing from older DB schemas
+    _migrate_add_column(cur, conn, "signals", "diagnostics", "TEXT")
+    _migrate_add_column(cur, conn, "strategy_results", "reason", "TEXT")
+    _migrate_add_column(cur, conn, "scan_runs", "valid_price_count", "INTEGER")
+    _migrate_add_column(cur, conn, "scan_runs", "rejected_bad_price_count", "INTEGER")
 
     conn.close()
     logger.info("Database initialized")
 
 
+def _migrate_add_column(cur, conn, table: str, column: str, col_type: str):
+    """Safely add a column to a table if it doesn't already exist."""
+    try:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        conn.commit()
+        logger.debug(f"Migration: added {table}.{column}")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+
 def insert_scan_run(run_date: str, total_scanned: int, total_signals: int,
-                    duration: float, status: str = "completed", error: str = None) -> int:
+                    duration: float, status: str = "completed", error: str = None,
+                    valid_price_count: int = 0,
+                    rejected_bad_price_count: int = 0) -> int:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO scan_runs (run_date, market, total_scanned, total_signals, duration_seconds, status, error)
-           VALUES (?, 'US', ?, ?, ?, ?, ?)""",
-        (run_date, total_scanned, total_signals, duration, status, error)
+        """INSERT INTO scan_runs
+           (run_date, market, total_scanned, valid_price_count, rejected_bad_price_count,
+            total_signals, duration_seconds, status, error)
+           VALUES (?, 'US', ?, ?, ?, ?, ?, ?, ?)""",
+        (run_date, total_scanned, valid_price_count, rejected_bad_price_count,
+         total_signals, duration, status, error)
     )
     run_id = cur.lastrowid
     conn.commit()
@@ -120,16 +142,24 @@ def upsert_signal(scan_run_id: int, signal: dict) -> int:
     """
     Insert a signal row for (symbol, signal_date).
     If the row already exists (same-day rerun), skip the insert and return
-    the existing row's id. The existing record is left unchanged.
+    the existing row's id.
     """
     conn = get_conn()
     cur = conn.cursor()
+
+    diagnostics_json = None
+    if signal.get("diagnostics"):
+        try:
+            diagnostics_json = json.dumps(signal["diagnostics"])
+        except Exception:
+            pass
+
     cur.execute(
         """INSERT OR IGNORE INTO signals
            (scan_run_id, symbol, company_name, sector, industry, market_cap, signal_date,
             close_price, volume, trend_score, relative_strength_score, volume_score,
-            pullback_risk_score, sector_score, total_score, strategies)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            pullback_risk_score, sector_score, total_score, strategies, diagnostics)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             scan_run_id,
             signal.get("symbol"),
@@ -147,6 +177,7 @@ def upsert_signal(scan_run_id: int, signal: dict) -> int:
             signal.get("sector_score"),
             signal.get("total_score"),
             ",".join(signal.get("strategies", [])),
+            diagnostics_json,
         )
     )
     conn.commit()
@@ -154,7 +185,6 @@ def upsert_signal(scan_run_id: int, signal: dict) -> int:
     if cur.lastrowid:
         signal_id = cur.lastrowid
     else:
-        # Row was ignored — fetch the id of the existing record
         cur.execute(
             "SELECT id FROM signals WHERE symbol=? AND signal_date=?",
             (signal.get("symbol"), signal.get("signal_date")),
@@ -171,7 +201,8 @@ def upsert_signal(scan_run_id: int, signal: dict) -> int:
 
 
 def insert_strategy_result(signal_id: int, strategy_name: str, symbol: str,
-                            signal_date: str, rank: int, details: str = ""):
+                            signal_date: str, rank: int, details: str = "",
+                            reason: str = ""):
     """
     Insert a strategy_result row. Silently skipped if the same
     (symbol, strategy_name, signal_date) already exists.
@@ -180,13 +211,13 @@ def insert_strategy_result(signal_id: int, strategy_name: str, symbol: str,
     cur = conn.cursor()
     cur.execute(
         """INSERT OR IGNORE INTO strategy_results
-           (signal_id, strategy_name, symbol, signal_date, rank_in_strategy, details)
-           VALUES (?,?,?,?,?,?)""",
-        (signal_id, strategy_name, symbol, signal_date, rank, details)
+           (signal_id, strategy_name, symbol, signal_date, rank_in_strategy, details, reason)
+           VALUES (?,?,?,?,?,?,?)""",
+        (signal_id, strategy_name, symbol, signal_date, rank, details, reason)
     )
     if cur.rowcount == 0:
         logger.debug(
-            f"strategy_result already exists for {symbol} / {strategy_name} "
+            f"strategy_result already exists for {symbol}/{strategy_name} "
             f"on {signal_date} — skipped"
         )
     conn.commit()

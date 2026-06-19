@@ -11,7 +11,7 @@ from market_hunter.data.price import (
 from market_hunter.strategies.ma60_reclaim import check_ma60_reclaim_pullback
 from market_hunter.strategies.strong_trend import check_strong_trend_pullback
 from market_hunter.strategies.new_high import check_new_high_breakout
-from market_hunter.scoring.scorer import compute_total_score
+from market_hunter.scoring.scorer import compute_total_score, compute_diagnostics
 from market_hunter.database import db
 from market_hunter.telegram import notifier
 
@@ -21,9 +21,8 @@ logger = logging.getLogger(__name__)
 def _enrich_missing_sectors(signals: list[dict]) -> None:
     """
     Fill in sector/industry from yfinance for any signal still missing it.
-    Called only on the small final set (≤ 20 stocks) so the heavier
-    ticker.info calls don't affect the main scan loop.
-    Mutates the dicts in-place.
+    Called only on the small final set so the heavy ticker.info calls stay
+    out of the main loop.  Mutates in-place.
     """
     cache: dict[str, dict] = {}
     for sig in signals:
@@ -44,7 +43,6 @@ def run_us_scan(notify: bool = True) -> dict:
 
     db.init_db()
 
-    # Fetch universe (FMP constituents → public S&P 500 fallback)
     universe = get_us_stock_universe()
     if not universe:
         error = "Failed to fetch stock universe from all sources"
@@ -56,7 +54,6 @@ def run_us_scan(notify: bool = True) -> dict:
 
     logger.info(f"Universe: {len(universe)} stocks")
 
-    # SPY for relative strength scoring
     spy_df = get_spy_ohlcv()
     spy_df = compute_indicators(spy_df) if not spy_df.empty else spy_df
 
@@ -64,7 +61,10 @@ def run_us_scan(notify: bool = True) -> dict:
     ma60_signals: list[dict] = []
     strong_trend_signals: list[dict] = []
     new_high_signals: list[dict] = []
+
     total_scanned = 0
+    valid_price_count = 0
+    rejected_bad_price_count = 0
 
     for stock in universe:
         symbol = stock.get("symbol", "")
@@ -72,9 +72,15 @@ def run_us_scan(notify: bool = True) -> dict:
             continue
 
         try:
-            # Single Ticker object → OHLCV + market_cap (fast_info)
-            df, market_cap = get_ohlcv_and_market_cap(symbol)
+            # Single Ticker session: OHLCV + market_cap + price validation
+            df, market_cap, price_valid = get_ohlcv_and_market_cap(symbol, validate=True)
+
             if df.empty or len(df) < 60:
+                continue
+
+            if not price_valid:
+                rejected_bad_price_count += 1
+                logger.warning(f"{symbol}: rejected — price cross-check failed")
                 continue
 
             df = compute_indicators(df)
@@ -84,18 +90,16 @@ def run_us_scan(notify: bool = True) -> dict:
             if adv < MIN_AVG_DOLLAR_VOLUME:
                 continue
 
-            # Market cap filter (yfinance fast_info)
-            # S&P 500 stocks all qualify, but keep the check for correctness.
+            # Market cap filter
             if market_cap > 0 and market_cap < MIN_MARKET_CAP:
                 continue
 
+            valid_price_count += 1
             total_scanned += 1
 
-            # Sector from universe (populated by FMP constituents or S&P 500 CSV).
-            # If still empty, _enrich_missing_sectors fills it in after the loop
-            # for the small final set of results only.
             sector = stock.get("sector", "")
             scores = compute_total_score(df, spy_df, sector=sector)
+            diag = compute_diagnostics(df, spy_df)
 
             last = df.iloc[-1]
             signal_base: dict = {
@@ -108,6 +112,7 @@ def run_us_scan(notify: bool = True) -> dict:
                 "close_price": round(float(last["Close"]), 2),
                 "volume": int(last["Volume"]),
                 "strategies": [],
+                "diagnostics": diag,
                 **scores,
             }
 
@@ -115,19 +120,28 @@ def run_us_scan(notify: bool = True) -> dict:
             ma60 = check_ma60_reclaim_pullback(df)
             if ma60["triggered"]:
                 signal_base["strategies"].append("ma60_reclaim")
-                ma60_signals.append({**signal_base, "strategy_details": ma60["details"]})
+                ma60_signals.append({
+                    **signal_base,
+                    "strategy_details": ma60["details"],
+                })
 
             # Strategy B — Strong Trend Pullback
             strong = check_strong_trend_pullback(df)
             if strong["triggered"]:
                 signal_base["strategies"].append("strong_trend")
-                strong_trend_signals.append({**signal_base, "strategy_details": strong["details"]})
+                strong_trend_signals.append({
+                    **signal_base,
+                    "strategy_details": strong["details"],
+                })
 
             # Strategy C — New High Breakout
             new_high = check_new_high_breakout(df)
             if new_high["triggered"]:
                 signal_base["strategies"].append("new_high")
-                new_high_signals.append({**signal_base, "strategy_details": new_high["details"]})
+                new_high_signals.append({
+                    **signal_base,
+                    "strategy_details": new_high["details"],
+                })
 
             all_signals.append(signal_base)
 
@@ -135,7 +149,7 @@ def run_us_scan(notify: bool = True) -> dict:
             logger.warning(f"Error processing {symbol}: {e}")
             continue
 
-    # Sort by total_score descending
+    # Sort
     all_signals.sort(key=lambda x: x["total_score"], reverse=True)
     ma60_signals.sort(key=lambda x: x["total_score"], reverse=True)
     strong_trend_signals.sort(key=lambda x: x["total_score"], reverse=True)
@@ -146,22 +160,37 @@ def run_us_scan(notify: bool = True) -> dict:
     top_strong = strong_trend_signals[:5]
     top_new_high = new_high_signals[:5]
 
-    # Enrich sector/industry only where still missing (small set)
+    # Enrich sectors for top picks where missing
     all_top = top20 + top_ma60 + top_strong + top_new_high
     _enrich_missing_sectors(all_top)
 
     duration = time.time() - start_time
     total_signals = len(ma60_signals) + len(strong_trend_signals) + len(new_high_signals)
 
-    # Persist to DB
-    run_id = db.insert_scan_run(scan_date, total_scanned, total_signals, duration)
+    logger.info(
+        f"Scan complete in {duration:.1f}s — scanned {total_scanned}, "
+        f"valid_price={valid_price_count}, rejected={rejected_bad_price_count}, "
+        f"signals: MA60={len(ma60_signals)}, Strong={len(strong_trend_signals)}, "
+        f"NewHigh={len(new_high_signals)}"
+    )
+
+    # Persist
+    run_id = db.insert_scan_run(
+        scan_date, total_scanned, total_signals, duration,
+        valid_price_count=valid_price_count,
+        rejected_bad_price_count=rejected_bad_price_count,
+    )
 
     def _save_signals(signals: list[dict], strategy_name: str) -> None:
         for rank, sig in enumerate(signals, 1):
             sig_id = db.upsert_signal(run_id, sig)
+            details = sig.get("strategy_details", {})
+            reason = notifier._strategy_reason(
+                strategy_name, details, sig.get("diagnostics") or {}
+            )
             db.insert_strategy_result(
                 sig_id, strategy_name, sig["symbol"], scan_date, rank,
-                str(sig.get("strategy_details", {}))
+                str(details), reason,
             )
 
     _save_signals(top_ma60, "ma60_reclaim")
@@ -179,13 +208,13 @@ def run_us_scan(notify: bool = True) -> dict:
         "strong_trend": top_strong,
         "new_high": top_new_high,
         "duration_seconds": round(duration, 1),
+        "summary": {
+            "scanned_count": total_scanned,
+            "valid_price_count": valid_price_count,
+            "rejected_bad_price_count": rejected_bad_price_count,
+            "signal_count": total_signals,
+        },
     }
-
-    logger.info(
-        f"Scan complete in {duration:.1f}s — scanned {total_scanned}, "
-        f"signals: MA60={len(ma60_signals)}, Strong={len(strong_trend_signals)}, "
-        f"NewHigh={len(new_high_signals)}"
-    )
 
     if notify:
         notifier.send_scan_report(scan_date, results)

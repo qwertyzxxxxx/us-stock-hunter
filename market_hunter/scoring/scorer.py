@@ -1,11 +1,11 @@
 import pandas as pd
-import numpy as np
 import logging
 
 logger = logging.getLogger(__name__)
 
 SECTOR_SCORES = {
     "Technology": 10,
+    "Information Technology": 10,
     "Health Care": 9,
     "Consumer Discretionary": 8,
     "Industrials": 7,
@@ -161,4 +161,77 @@ def compute_total_score(df: pd.DataFrame, spy_df: pd.DataFrame, sector: str) -> 
         "pullback_risk_score": round(pullback, 2),
         "sector_score": round(sect, 2),
         "total_score": round(total, 2),
+    }
+
+
+def compute_diagnostics(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
+    """
+    Compute rich diagnostic metrics for Telegram output and DB storage.
+    Separate from scoring — does not affect any scores.
+    Returns a flat dict of all diagnostic values (None when unavailable).
+    """
+    if df.empty:
+        return {}
+
+    last = df.iloc[-1]
+
+    def _safe(col) -> float | None:
+        v = last.get(col)
+        return round(float(v), 4) if pd.notna(v) else None
+
+    ma20 = _safe("MA20")
+    ma50 = _safe("MA50")
+    ma60 = _safe("MA60")
+    ma200 = _safe("MA200")
+
+    # Volume ratio (today vs 20-day avg)
+    vol_ratio = None
+    vol_ma20 = last.get("VolMA20")
+    if pd.notna(vol_ma20) and float(vol_ma20) > 0:
+        vol_ratio = round(float(last["Volume"]) / float(vol_ma20), 2)
+
+    # Daily dollar volume
+    dollar_volume = round(float(last["Close"]) * float(last["Volume"]), 0)
+
+    # Price returns
+    ret_20d = None
+    if len(df) >= 21:
+        ret_20d = round((df["Close"].iloc[-1] / df["Close"].iloc[-21] - 1) * 100, 2)
+
+    ret_60d = None
+    if len(df) >= 61:
+        ret_60d = round((df["Close"].iloc[-1] / df["Close"].iloc[-61] - 1) * 100, 2)
+
+    # Relative strength vs SPY
+    rs_vs_spy_20d = None
+    rs_vs_spy_60d = None
+    if not spy_df.empty:
+        if len(df) >= 21 and len(spy_df) >= 21:
+            stock_ret = df["Close"].iloc[-1] / df["Close"].iloc[-21] - 1
+            spy_ret = spy_df["Close"].iloc[-1] / spy_df["Close"].iloc[-21] - 1
+            rs_vs_spy_20d = round((stock_ret - spy_ret) * 100, 2)
+
+        if len(df) >= 61 and len(spy_df) >= 61:
+            stock_ret = df["Close"].iloc[-1] / df["Close"].iloc[-61] - 1
+            spy_ret = spy_df["Close"].iloc[-1] / spy_df["Close"].iloc[-61] - 1
+            rs_vs_spy_60d = round((stock_ret - spy_ret) * 100, 2)
+
+    # Distance from 52-week high
+    distance_52w_high = None
+    high52 = last.get("High52W")
+    if pd.notna(high52) and float(high52) > 0:
+        distance_52w_high = round((float(last["Close"]) / float(high52) - 1) * 100, 2)
+
+    return {
+        "ma20": ma20,
+        "ma50": ma50,
+        "ma60": ma60,
+        "ma200": ma200,
+        "volume_ratio": vol_ratio,
+        "dollar_volume": dollar_volume,
+        "return_20d": ret_20d,
+        "return_60d": ret_60d,
+        "rs_vs_spy_20d": rs_vs_spy_20d,
+        "rs_vs_spy_60d": rs_vs_spy_60d,
+        "distance_52w_high": distance_52w_high,
     }
