@@ -181,11 +181,20 @@ def run_us_scan(notify: bool = True) -> dict:
             logger.warning(f"Error processing {symbol}: {e}")
             continue
 
-    # Sort
+    # Sort all_signals by score (for Top 20 compact list)
     all_signals.sort(key=lambda x: x["total_score"], reverse=True)
-    ma60_signals.sort(key=lambda x: x["total_score"], reverse=True)
-    strong_trend_signals.sort(key=lambda x: x["total_score"], reverse=True)
-    new_high_signals.sort(key=lambda x: x["total_score"], reverse=True)
+
+    # Strategy lists: prioritise actionable (可关注买点) first, then by score.
+    # action_status lives inside entry_plan, computed per strategy signal.
+    def _strategy_sort_key(sig: dict) -> tuple:
+        ep = sig.get("entry_plan") or {}
+        status = ep.get("action_status", "观察")
+        is_actionable = 1 if status == "可关注买点" else 0
+        return (is_actionable, sig["total_score"])
+
+    ma60_signals.sort(key=_strategy_sort_key, reverse=True)
+    strong_trend_signals.sort(key=_strategy_sort_key, reverse=True)
+    new_high_signals.sort(key=_strategy_sort_key, reverse=True)
 
     top20 = all_signals[:20]
     top_ma60 = ma60_signals[:5]

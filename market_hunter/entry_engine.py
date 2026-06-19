@@ -10,6 +10,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+MAX_RISK_PCT = 8.0      # risk > this → "风险过高，等待回踩"
+MIN_RR_RATIO = 1.5      # rr  < this → "观察"
+
 
 def _r2(v) -> float:
     return round(float(v), 2)
@@ -21,13 +24,29 @@ def _rr(reward: float, risk: float) -> float | None:
     return round(reward / risk, 1)
 
 
+def _action_status(rr_ratio: float | None, risk_pct: float | None) -> str:
+    """
+    Classify entry quality into one of three states:
+
+    风险过高，等待回踩  — risk > 8 % (takes priority)
+    观察               — rr_ratio < 1.5
+    可关注买点          — rr >= 1.5 and risk <= 8 %
+    """
+    if risk_pct is not None and float(risk_pct) > MAX_RISK_PCT:
+        return "风险过高，等待回踩"
+    if rr_ratio is None or float(rr_ratio) < MIN_RR_RATIO:
+        return "观察"
+    return "可关注买点"
+
+
 def compute_entry_plan(strategy_name: str, df: pd.DataFrame, details: dict) -> dict:
     """
-    Compute entry zone, trigger, stop, targets, and R:R for one strategy signal.
+    Compute entry zone, trigger, stop, targets, R:R and action_status.
 
-    Returns a flat dict:
+    Returned dict keys:
         entry_zone_low, entry_zone_high, trigger_price,
-        stop_loss, risk_pct, target1, target2, target2_note, rr_ratio
+        stop_loss, risk_pct, target1, target2, target2_note,
+        rr_ratio, action_status
     Returns {} on any error.
     """
     try:
@@ -58,12 +77,11 @@ def _plan_ma60(last, df: pd.DataFrame, close: float, details: dict) -> dict:
 
     entry_low = _r2(ma60 * 0.98)
     entry_high = _r2(ma60 * 1.02)
-    trigger = _r2(ma60 * 1.005)   # close just above MA60
-    stop = _r2(ma60 * 0.97)       # MA60 -3%
+    trigger = _r2(ma60 * 1.005)   # just above MA60
+    stop = _r2(ma60 * 0.97)       # MA60 −3%
 
-    # Target1: swing high after the MA60 cross (peak_after_cross from strategy)
+    # Target1: swing high after cross (or conservative +8% floor)
     swing_high = float(details.get("peak_after_cross") or df["High"].tail(30).max())
-    # If swing high is already lower than trigger, use a conservative +8%
     target1 = _r2(max(swing_high, trigger * 1.08))
     target2 = _r2(high52)
 
@@ -71,6 +89,7 @@ def _plan_ma60(last, df: pd.DataFrame, close: float, details: dict) -> dict:
     reward1 = max(target1 - trigger, 0)
     risk_pct = _r2((risk / trigger) * 100) if trigger > 0 else None
     rr = _rr(reward1, risk)
+    status = _action_status(rr, risk_pct)
 
     return {
         "entry_zone_low": entry_low,
@@ -82,6 +101,7 @@ def _plan_ma60(last, df: pd.DataFrame, close: float, details: dict) -> dict:
         "target2": target2,
         "target2_note": None,
         "rr_ratio": rr,
+        "action_status": status,
     }
 
 
@@ -100,13 +120,21 @@ def _plan_strong_trend(last, df: pd.DataFrame, close: float, details: dict) -> d
 
     # Trigger: break above previous day's high
     trigger = _r2(float(df["High"].iloc[-2]))
-    stop = _r2(ma50 * 0.99)        # just below MA50
-    target1 = _r2(close * 1.10)    # +10%
+
+    # Stop: closer of (recent swing low −1%) vs (MA50 −2%)
+    # "Closer" = higher price = less risk.  Use max() of the two.
+    recent_swing_low = float(df["Low"].tail(5).min())
+    stop_swing = recent_swing_low * 0.99    # swing low −1%
+    stop_ma50  = ma50 * 0.98               # MA50 −2%
+    stop = _r2(max(stop_swing, stop_ma50))
+
+    target1 = _r2(close * 1.10)   # +10%
 
     risk = max(trigger - stop, 0.01)
     reward1 = max(target1 - trigger, 0)
     risk_pct = _r2((risk / trigger) * 100) if trigger > 0 else None
     rr = _rr(reward1, risk)
+    status = _action_status(rr, risk_pct)
 
     return {
         "entry_zone_low": entry_low,
@@ -118,6 +146,7 @@ def _plan_strong_trend(last, df: pd.DataFrame, close: float, details: dict) -> d
         "target2": None,
         "target2_note": "跟踪止盈（MA20）",
         "rr_ratio": rr,
+        "action_status": status,
     }
 
 
@@ -138,6 +167,7 @@ def _plan_new_high(last, df: pd.DataFrame, close: float, details: dict) -> dict:
     reward1 = max(target1 - trigger, 0)
     risk_pct = _r2((risk / trigger) * 100) if trigger > 0 else None
     rr = _rr(reward1, risk)
+    status = _action_status(rr, risk_pct)
 
     return {
         "entry_zone_low": entry_low,
@@ -149,4 +179,5 @@ def _plan_new_high(last, df: pd.DataFrame, close: float, details: dict) -> dict:
         "target2": None,
         "target2_note": "跟踪止盈",
         "rr_ratio": rr,
+        "action_status": status,
     }

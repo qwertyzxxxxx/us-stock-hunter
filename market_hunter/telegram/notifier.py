@@ -46,6 +46,13 @@ STRATEGY_EMOJI: dict[str, str] = {
     "new_high": "🚀",
 }
 
+# action_status display config: (emoji, short label)
+STATUS_DISPLAY: dict[str, tuple[str, str]] = {
+    "可关注买点":       ("✅", "可关注买点"),
+    "观察":            ("⚠️", "观察，不可买入"),
+    "风险过高，等待回踩": ("❗", "风险过高，等待更低回踩"),
+}
+
 
 # ---------------------------------------------------------------------------
 # Formatting helpers
@@ -123,12 +130,43 @@ def _rr_str(ep: dict) -> str:
     return f"1:{float(rr):.1f}"
 
 
+def _status_lines(ep: dict) -> list[str]:
+    """
+    Return the 状态 / 原因 block for a stock card.
+
+    状态：✅ 可关注买点
+    or
+    状态：⚠️ 观察，不可买入
+    原因：风险回报比不足（1:0.3）
+    or
+    状态：❗ 风险过高，等待更低回踩
+    原因：当前风险 23.7%，超过 8% 上限
+    """
+    if not ep:
+        return []
+
+    status = ep.get("action_status", "观察")
+    emoji, label = STATUS_DISPLAY.get(status, ("⚠️", status))
+    rr = ep.get("rr_ratio")
+    risk_pct = ep.get("risk_pct")
+
+    lines = [f"状态：{emoji} {label}"]
+
+    if status == "观察":
+        rr_txt = _rr_str(ep)
+        lines.append(f"原因：风险回报比不足（{rr_txt}）")
+    elif status == "风险过高，等待回踩":
+        risk_txt = f"{float(risk_pct):.1f}%" if risk_pct is not None else "N/A"
+        lines.append(f"原因：当前风险 {risk_txt}，超过 8% 上限")
+
+    return lines
+
+
 # ---------------------------------------------------------------------------
-# Reason lines (Part 2 + strategy context)
+# Reason lines
 # ---------------------------------------------------------------------------
 
 def _build_reason_text(strategy_name: str, details: dict, diag: dict) -> str:
-    """Generate a plain-text Chinese reason string. Used for DB storage and Telegram."""
     lines = _reason_lines(strategy_name, details, diag)
     return "\n".join(lines)
 
@@ -136,7 +174,6 @@ def _build_reason_text(strategy_name: str, details: dict, diag: dict) -> str:
 def _reason_lines(strategy_name: str, details: dict, diag: dict) -> list[str]:
     vol_ratio = diag.get("volume_ratio")
     rs_20d = diag.get("rs_vs_spy_20d")
-    dist_52w = diag.get("distance_52w_high")
 
     lines: list[str] = []
 
@@ -188,7 +225,7 @@ def _reason_lines(strategy_name: str, details: dict, diag: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Stock card formatter (Part 6)
+# Stock card formatter
 # ---------------------------------------------------------------------------
 
 def _format_stock_card(sig: dict, strategy_name: str) -> str:
@@ -205,14 +242,14 @@ def _format_stock_card(sig: dict, strategy_name: str) -> str:
     strategy_zh = _zh_strategy_with_emoji(strategy_name)
     score = sig.get("total_score", 0)
 
-    # Scoring breakdown
-    t_score = sig.get("trend_score", 0)
+    t_score  = sig.get("trend_score", 0)
     rs_score = sig.get("relative_strength_score", 0)
-    v_score = sig.get("volume_score", 0)
+    v_score  = sig.get("volume_score", 0)
     pb_score = sig.get("pullback_risk_score", 0)
     sec_score = sig.get("sector_score", 0)
 
     reason_lns = _reason_lines(strategy_name, details, diag)
+    status_lns = _status_lines(ep)
 
     parts = [
         f"<b>{symbol}</b>",
@@ -220,6 +257,15 @@ def _format_stock_card(sig: dict, strategy_name: str) -> str:
         "",
         f"策略：",
         f"{strategy_zh}",
+    ]
+
+    # ── action status block ──────────────────────────────────────────────
+    if status_lns:
+        parts.append("")
+        parts.extend(status_lns)
+
+    # ── scoring ──────────────────────────────────────────────────────────
+    parts += [
         "",
         f"评分：",
         f"<b>{score:.0f}分</b>",
@@ -251,8 +297,14 @@ def _format_stock_card(sig: dict, strategy_name: str) -> str:
         f"60日：{_pct_str(diag.get('rs_vs_spy_60d'))}",
     ]
 
-    # Entry plan
+    # ── entry plan (always show, even for non-actionable) ────────────────
     if ep:
+        rr = ep.get("rr_ratio")
+        risk_pct = ep.get("risk_pct")
+        risk_note = ""
+        if risk_pct is not None and float(risk_pct) > 8.0:
+            risk_note = f"  ❗超过8%上限"
+
         parts += [
             "",
             f"买入观察区：",
@@ -270,11 +322,11 @@ def _format_stock_card(sig: dict, strategy_name: str) -> str:
             f"目标2：",
             f"{_target2_str(ep)}",
             "",
-            f"风险回报比：",
-            f"{_rr_str(ep)}",
+            f"风险：{f'{float(risk_pct):.1f}%' if risk_pct is not None else 'N/A'}{risk_note}",
+            f"风险回报比：{_rr_str(ep)}",
         ]
 
-    # Reason
+    # ── reason ───────────────────────────────────────────────────────────
     if reason_lns:
         parts += ["", "原因：", ""] + reason_lns
 
@@ -282,22 +334,22 @@ def _format_stock_card(sig: dict, strategy_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Summary message (Parts 5 + 7)
+# Summary message
 # ---------------------------------------------------------------------------
 
 def _format_summary(scan_date: str, results: dict) -> str:
     summary = results.get("summary", {})
     scanned = summary.get("scanned_count", results.get("total_scanned", 0))
-    valid = summary.get("valid_price_count", scanned)
+    valid    = summary.get("valid_price_count", scanned)
     rejected = summary.get("rejected_bad_price_count", 0)
     duration = results.get("duration_seconds", 0)
 
     dr = results.get("diagnostics_report", {})
-    ma60_cnt = dr.get("ma60_count", 0)
+    ma60_cnt   = dr.get("ma60_count", 0)
     strong_cnt = dr.get("strong_trend_count", 0)
-    nh_cnt = dr.get("new_high_count", 0)
-    total_sig = ma60_cnt + strong_cnt + nh_cnt
-    avg_score = dr.get("avg_score", 0)
+    nh_cnt     = dr.get("new_high_count", 0)
+    total_sig  = ma60_cnt + strong_cnt + nh_cnt
+    avg_score  = dr.get("avg_score", 0)
     top_sectors = dr.get("top_sectors", [])
 
     lines = [
@@ -323,7 +375,6 @@ def _format_summary(scan_date: str, results: dict) -> str:
             m = medals[i] if i < len(medals) else f"{i+1}."
             lines.append(f"  {m} {_zh_sector(sector)} {cnt}只")
 
-    # Compact top10
     top20 = results.get("top20", [])
     if top20:
         lines += ["", "🏆 <b>综合评分 Top10</b>"]
@@ -343,11 +394,10 @@ def _format_summary(scan_date: str, results: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Multi-message send (Part 6 + strategy sections)
+# Multi-message send
 # ---------------------------------------------------------------------------
 
 def _chunked_send(messages: list[str]) -> bool:
-    """Send a list of pre-formatted messages, splitting any that exceed the limit."""
     ok = True
     for text in messages:
         if not text.strip():
@@ -363,15 +413,13 @@ def send_scan_report(scan_date: str, results: dict) -> bool:
     Send full Chinese scan report as multiple Telegram messages:
       1. Summary (scan stats + diagnostics + Top 10)
       2–4. One message per strategy with detailed stock cards
+           — actionable cards (✅) appear first within each section.
     """
     messages: list[str] = []
-
-    # Message 1 — summary
     messages.append(_format_summary(scan_date, results))
 
-    # Messages 2-4 — strategy sections
     strategy_map = [
-        ("ma60_reclaim",  STRATEGY_ZH["ma60_reclaim"]),
+        ("ma60_reclaim", STRATEGY_ZH["ma60_reclaim"]),
         ("strong_trend",  STRATEGY_ZH["strong_trend"]),
         ("new_high",      STRATEGY_ZH["new_high"]),
     ]
@@ -381,20 +429,25 @@ def send_scan_report(scan_date: str, results: dict) -> bool:
         if not picks:
             continue
 
-        section_parts = [
-            f"{STRATEGY_EMOJI.get(key, '')} <b>{label_zh} — Top {len(picks)}</b>",
-            "━" * 20,
-        ]
+        # Count actionable for section header info
+        actionable_n = sum(
+            1 for s in picks
+            if (s.get("entry_plan") or {}).get("action_status") == "可关注买点"
+        )
+        header = (
+            f"{STRATEGY_EMOJI.get(key, '')} <b>{label_zh} — Top {len(picks)}</b>"
+            f"（可买入 {actionable_n} 个）"
+        )
+
+        section_parts = [header, "━" * 20]
         for sig in picks:
             section_parts.append(_format_stock_card(sig, key))
             section_parts.append("━" * 20)
 
         section_text = "\n".join(section_parts)
 
-        # If the full section is too long, send each card individually
         if len(section_text) > TELEGRAM_MAX_CHARS:
-            # Send header
-            messages.append(f"{STRATEGY_EMOJI.get(key, '')} <b>{label_zh}</b>")
+            messages.append(header)
             for sig in picks:
                 messages.append(_format_stock_card(sig, key))
         else:
@@ -411,7 +464,6 @@ def send_scan_report(scan_date: str, results: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def send_message(text: str) -> bool:
-    """Send a single HTML message to the configured Telegram chat."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram not configured — skipping")
         return False
@@ -433,6 +485,5 @@ def send_message(text: str) -> bool:
 
 
 def send_error(error_msg: str) -> bool:
-    """Send an error notification."""
     text = f"<b>❌ Market Hunter 错误</b>\n\n<code>{error_msg}</code>"
     return send_message(text)
