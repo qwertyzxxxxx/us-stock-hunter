@@ -12,6 +12,7 @@ from market_hunter.strategies.ma60_reclaim import check_ma60_reclaim_pullback
 from market_hunter.strategies.strong_trend import check_strong_trend_pullback
 from market_hunter.strategies.new_high import check_new_high_breakout
 from market_hunter.scoring.scorer import compute_total_score, compute_diagnostics
+from market_hunter.entry_engine import compute_entry_plan
 from market_hunter.database import db
 from market_hunter.telegram import notifier
 
@@ -19,11 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def _enrich_missing_sectors(signals: list[dict]) -> None:
-    """
-    Fill in sector/industry from yfinance for any signal still missing it.
-    Called only on the small final set so the heavy ticker.info calls stay
-    out of the main loop.  Mutates in-place.
-    """
+    """Fill missing sector/industry via yfinance (small final set only)."""
     cache: dict[str, dict] = {}
     for sig in signals:
         if sig.get("sector"):
@@ -33,6 +30,38 @@ def _enrich_missing_sectors(signals: list[dict]) -> None:
             cache[sym] = get_sector_industry(sym)
         sig["sector"] = cache[sym]["sector"]
         sig["industry"] = cache[sym]["industry"]
+
+
+def _build_diagnostics_report(
+    all_signals: list[dict],
+    ma60_signals: list[dict],
+    strong_signals: list[dict],
+    new_high_signals: list[dict],
+) -> dict:
+    """
+    Part 7 — signal quality diagnostics.
+    Counts by strategy, average score, top sectors.
+    Does NOT modify signal lists.
+    """
+    sector_counts: dict[str, int] = {}
+    for sig in all_signals:
+        s = sig.get("sector") or "其他"
+        sector_counts[s] = sector_counts.get(s, 0) + 1
+
+    top_sectors = sorted(sector_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+    avg_score = (
+        sum(s["total_score"] for s in all_signals) / len(all_signals)
+        if all_signals else 0.0
+    )
+
+    return {
+        "ma60_count": len(ma60_signals),
+        "strong_trend_count": len(strong_signals),
+        "new_high_count": len(new_high_signals),
+        "total_signal_count": len(ma60_signals) + len(strong_signals) + len(new_high_signals),
+        "avg_score": round(avg_score, 1),
+        "top_sectors": top_sectors,
+    }
 
 
 def run_us_scan(notify: bool = True) -> dict:
@@ -45,7 +74,7 @@ def run_us_scan(notify: bool = True) -> dict:
 
     universe = get_us_stock_universe()
     if not universe:
-        error = "Failed to fetch stock universe from all sources"
+        error = "Failed to fetch stock universe"
         logger.error(error)
         db.insert_scan_run(scan_date, 0, 0, 0, "failed", error)
         if notify:
@@ -72,7 +101,6 @@ def run_us_scan(notify: bool = True) -> dict:
             continue
 
         try:
-            # Single Ticker session: OHLCV + market_cap + price validation
             df, market_cap, price_valid = get_ohlcv_and_market_cap(symbol, validate=True)
 
             if df.empty or len(df) < 60:
@@ -85,12 +113,10 @@ def run_us_scan(notify: bool = True) -> dict:
 
             df = compute_indicators(df)
 
-            # Dollar volume filter
             adv = avg_dollar_volume(df)
             if adv < MIN_AVG_DOLLAR_VOLUME:
                 continue
 
-            # Market cap filter
             if market_cap > 0 and market_cap < MIN_MARKET_CAP:
                 continue
 
@@ -120,27 +146,33 @@ def run_us_scan(notify: bool = True) -> dict:
             ma60 = check_ma60_reclaim_pullback(df)
             if ma60["triggered"]:
                 signal_base["strategies"].append("ma60_reclaim")
+                ep = compute_entry_plan("ma60_reclaim", df, ma60["details"])
                 ma60_signals.append({
                     **signal_base,
                     "strategy_details": ma60["details"],
+                    "entry_plan": ep,
                 })
 
             # Strategy B — Strong Trend Pullback
             strong = check_strong_trend_pullback(df)
             if strong["triggered"]:
                 signal_base["strategies"].append("strong_trend")
+                ep = compute_entry_plan("strong_trend", df, strong["details"])
                 strong_trend_signals.append({
                     **signal_base,
                     "strategy_details": strong["details"],
+                    "entry_plan": ep,
                 })
 
             # Strategy C — New High Breakout
             new_high = check_new_high_breakout(df)
             if new_high["triggered"]:
                 signal_base["strategies"].append("new_high")
+                ep = compute_entry_plan("new_high", df, new_high["details"])
                 new_high_signals.append({
                     **signal_base,
                     "strategy_details": new_high["details"],
+                    "entry_plan": ep,
                 })
 
             all_signals.append(signal_base)
@@ -160,18 +192,20 @@ def run_us_scan(notify: bool = True) -> dict:
     top_strong = strong_trend_signals[:5]
     top_new_high = new_high_signals[:5]
 
-    # Enrich sectors for top picks where missing
-    all_top = top20 + top_ma60 + top_strong + top_new_high
-    _enrich_missing_sectors(all_top)
+    _enrich_missing_sectors(top20 + top_ma60 + top_strong + top_new_high)
 
     duration = time.time() - start_time
     total_signals = len(ma60_signals) + len(strong_trend_signals) + len(new_high_signals)
+
+    diag_report = _build_diagnostics_report(
+        all_signals, ma60_signals, strong_trend_signals, new_high_signals
+    )
 
     logger.info(
         f"Scan complete in {duration:.1f}s — scanned {total_scanned}, "
         f"valid_price={valid_price_count}, rejected={rejected_bad_price_count}, "
         f"signals: MA60={len(ma60_signals)}, Strong={len(strong_trend_signals)}, "
-        f"NewHigh={len(new_high_signals)}"
+        f"NewHigh={len(new_high_signals)}, avg_score={diag_report['avg_score']}"
     )
 
     # Persist
@@ -183,9 +217,24 @@ def run_us_scan(notify: bool = True) -> dict:
 
     def _save_signals(signals: list[dict], strategy_name: str) -> None:
         for rank, sig in enumerate(signals, 1):
+            # Merge entry plan into diagnostics before saving
+            merged_diag = {**(sig.get("diagnostics") or {})}
+            ep = sig.get("entry_plan") or {}
+            if ep:
+                merged_diag.update({
+                    "entry_zone_low": ep.get("entry_zone_low"),
+                    "entry_zone_high": ep.get("entry_zone_high"),
+                    "trigger_price": ep.get("trigger_price"),
+                    "stop_loss": ep.get("stop_loss"),
+                    "target1": ep.get("target1"),
+                    "target2": ep.get("target2"),
+                    "rr_ratio": ep.get("rr_ratio"),
+                })
+            sig["diagnostics"] = merged_diag
+
             sig_id = db.upsert_signal(run_id, sig)
             details = sig.get("strategy_details", {})
-            reason = notifier._strategy_reason(
+            reason = notifier._build_reason_text(
                 strategy_name, details, sig.get("diagnostics") or {}
             )
             db.insert_strategy_result(
@@ -214,6 +263,7 @@ def run_us_scan(notify: bool = True) -> dict:
             "rejected_bad_price_count": rejected_bad_price_count,
             "signal_count": total_signals,
         },
+        "diagnostics_report": diag_report,
     }
 
     if notify:

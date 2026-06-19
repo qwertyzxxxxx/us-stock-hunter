@@ -85,7 +85,6 @@ def init_db():
     """)
     conn.commit()
 
-    # Unique indexes
     for ddl in [
         """CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_symbol_date
            ON signals(symbol, signal_date)""",
@@ -98,25 +97,30 @@ def init_db():
         except sqlite3.OperationalError as e:
             logger.warning(f"Could not create unique index: {e}")
 
-    # Column migrations — add columns that may be missing from older DB schemas
-    _migrate_add_column(cur, conn, "signals", "diagnostics", "TEXT")
-    _migrate_add_column(cur, conn, "strategy_results", "reason", "TEXT")
-    _migrate_add_column(cur, conn, "scan_runs", "valid_price_count", "INTEGER")
-    _migrate_add_column(cur, conn, "scan_runs", "rejected_bad_price_count", "INTEGER")
+    # Backward-compatible column migrations
+    for table, col, col_type in [
+        ("signals",          "diagnostics",               "TEXT"),
+        ("strategy_results", "reason",                    "TEXT"),
+        ("scan_runs",        "valid_price_count",         "INTEGER"),
+        ("scan_runs",        "rejected_bad_price_count",  "INTEGER"),
+    ]:
+        _migrate_add_column(cur, conn, table, col, col_type)
 
     conn.close()
     logger.info("Database initialized")
 
 
 def _migrate_add_column(cur, conn, table: str, column: str, col_type: str):
-    """Safely add a column to a table if it doesn't already exist."""
     try:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
         conn.commit()
-        logger.debug(f"Migration: added {table}.{column}")
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+
+# ---------------------------------------------------------------------------
+# Write helpers
+# ---------------------------------------------------------------------------
 
 def insert_scan_run(run_date: str, total_scanned: int, total_signals: int,
                     duration: float, status: str = "completed", error: str = None,
@@ -139,11 +143,6 @@ def insert_scan_run(run_date: str, total_scanned: int, total_signals: int,
 
 
 def upsert_signal(scan_run_id: int, signal: dict) -> int:
-    """
-    Insert a signal row for (symbol, signal_date).
-    If the row already exists (same-day rerun), skip the insert and return
-    the existing row's id.
-    """
     conn = get_conn()
     cur = conn.cursor()
 
@@ -191,10 +190,6 @@ def upsert_signal(scan_run_id: int, signal: dict) -> int:
         )
         row = cur.fetchone()
         signal_id = row["id"] if row else 0
-        logger.debug(
-            f"Signal already exists for {signal.get('symbol')} on "
-            f"{signal.get('signal_date')} — skipped insert, using id={signal_id}"
-        )
 
     conn.close()
     return signal_id
@@ -203,10 +198,6 @@ def upsert_signal(scan_run_id: int, signal: dict) -> int:
 def insert_strategy_result(signal_id: int, strategy_name: str, symbol: str,
                             signal_date: str, rank: int, details: str = "",
                             reason: str = ""):
-    """
-    Insert a strategy_result row. Silently skipped if the same
-    (symbol, strategy_name, signal_date) already exists.
-    """
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -215,17 +206,15 @@ def insert_strategy_result(signal_id: int, strategy_name: str, symbol: str,
            VALUES (?,?,?,?,?,?,?)""",
         (signal_id, strategy_name, symbol, signal_date, rank, details, reason)
     )
-    if cur.rowcount == 0:
-        logger.debug(
-            f"strategy_result already exists for {symbol}/{strategy_name} "
-            f"on {signal_date} — skipped"
-        )
     conn.commit()
     conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Read helpers
+# ---------------------------------------------------------------------------
+
 def get_unevaluated_signals(days_old_min: int = 5) -> list[dict]:
-    """Get signals that haven't been evaluated yet and are old enough."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -291,5 +280,55 @@ def get_scan_runs(limit: int = 20) -> list[dict]:
     cur = conn.cursor()
     cur.execute("SELECT * FROM scan_runs ORDER BY created_at DESC LIMIT ?", (limit,))
     rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_strategy_performance(strategy_name: str = None) -> list[dict]:
+    """
+    Part 8 — Backtest preparation.
+    Compute win rate, average return, and count per strategy from evaluations.
+    A trade is a 'win' if return_20d > 0.
+    Pass strategy_name=None to get all strategies.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    where = ""
+    params: tuple = ()
+    if strategy_name:
+        where = "WHERE sr.strategy_name = ?"
+        params = (strategy_name,)
+
+    cur.execute(
+        f"""
+        SELECT
+            sr.strategy_name,
+            COUNT(*)                                    AS total_trades,
+            COUNT(e.return_20d)                         AS evaluated_count,
+            SUM(CASE WHEN e.return_20d > 0 THEN 1 ELSE 0 END) AS wins,
+            ROUND(AVG(e.return_5d),  2)                 AS avg_return_5d,
+            ROUND(AVG(e.return_10d), 2)                 AS avg_return_10d,
+            ROUND(AVG(e.return_20d), 2)                 AS avg_return_20d,
+            ROUND(AVG(e.max_drawdown), 2)               AS avg_max_drawdown,
+            ROUND(AVG(e.max_gain), 2)                   AS avg_max_gain,
+            ROUND(MIN(e.return_20d), 2)                 AS worst_return,
+            ROUND(MAX(e.return_20d), 2)                 AS best_return
+        FROM strategy_results sr
+        JOIN signals s ON s.id = sr.signal_id
+        LEFT JOIN evaluations e ON e.signal_id = sr.signal_id
+        {where}
+        GROUP BY sr.strategy_name
+        ORDER BY sr.strategy_name
+        """,
+        params,
+    )
+    rows = []
+    for r in cur.fetchall():
+        d = dict(r)
+        eval_cnt = d.get("evaluated_count") or 0
+        wins = d.get("wins") or 0
+        d["win_rate_pct"] = round(wins / eval_cnt * 100, 1) if eval_cnt > 0 else None
+        rows.append(d)
     conn.close()
     return rows

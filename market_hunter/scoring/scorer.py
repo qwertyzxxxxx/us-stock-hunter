@@ -19,6 +19,46 @@ SECTOR_SCORES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Volume rating (Part 2)
+# ---------------------------------------------------------------------------
+
+def volume_rating(ratio: float | None) -> tuple[str, str]:
+    """
+    Returns (display_label, category_key) for a volume ratio.
+    Labels are Chinese; category_key is English for logic branching.
+    """
+    if ratio is None:
+        return "N/A", "unknown"
+    if ratio >= 2.0:
+        return "🚀 放量突破", "explosive"
+    if ratio >= 1.5:
+        return "🔥 资金流入明显", "strong"
+    if ratio >= 1.2:
+        return "🟢 量能增强", "increasing"
+    if ratio >= 0.8:
+        return "🟡 量能正常", "normal"
+    return "🔴 量能偏弱", "weak"
+
+
+def volume_label_pullback(ratio: float | None) -> str:
+    """For pullback strategies: 缩量回踩 or 放量回踩."""
+    if ratio is None:
+        return ""
+    return "放量回踩" if ratio >= 1.0 else "缩量回踩"
+
+
+def volume_label_breakout(ratio: float | None) -> str:
+    """For breakout strategy: 放量突破 or 无量突破."""
+    if ratio is None:
+        return ""
+    return "放量突破" if ratio >= 1.5 else "无量突破"
+
+
+# ---------------------------------------------------------------------------
+# Scoring sub-components (unchanged)
+# ---------------------------------------------------------------------------
+
 def compute_trend_score(df: pd.DataFrame) -> float:
     """Score 0-30: measures trend alignment and strength."""
     if df.empty:
@@ -42,7 +82,6 @@ def compute_trend_score(df: pd.DataFrame) -> float:
         score += 8
     if pd.notna(ma200) and close > ma200:
         score += 7
-
     if pd.notna(ma20) and pd.notna(ma50) and ma20 > ma50:
         score += 4
     if pd.notna(ma50) and pd.notna(ma200) and pd.notna(ma20) and ma20 > ma50 > ma200:
@@ -57,7 +96,6 @@ def compute_relative_strength_score(df: pd.DataFrame, spy_df: pd.DataFrame) -> f
         return 0.0
 
     score = 0.0
-
     for days, weight in [(20, 12), (60, 13)]:
         if len(df) < days or len(spy_df) < days:
             continue
@@ -73,8 +111,6 @@ def compute_relative_strength_score(df: pd.DataFrame, spy_df: pd.DataFrame) -> f
             score += weight * 0.6
         elif rs > 0:
             score += weight * 0.3
-        else:
-            score += 0
 
     return min(score, 25.0)
 
@@ -167,8 +203,7 @@ def compute_total_score(df: pd.DataFrame, spy_df: pd.DataFrame, sector: str) -> 
 def compute_diagnostics(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
     """
     Compute rich diagnostic metrics for Telegram output and DB storage.
-    Separate from scoring — does not affect any scores.
-    Returns a flat dict of all diagnostic values (None when unavailable).
+    Does not affect any scoring.
     """
     if df.empty:
         return {}
@@ -184,16 +219,13 @@ def compute_diagnostics(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
     ma60 = _safe("MA60")
     ma200 = _safe("MA200")
 
-    # Volume ratio (today vs 20-day avg)
     vol_ratio = None
     vol_ma20 = last.get("VolMA20")
     if pd.notna(vol_ma20) and float(vol_ma20) > 0:
         vol_ratio = round(float(last["Volume"]) / float(vol_ma20), 2)
 
-    # Daily dollar volume
     dollar_volume = round(float(last["Close"]) * float(last["Volume"]), 0)
 
-    # Price returns
     ret_20d = None
     if len(df) >= 21:
         ret_20d = round((df["Close"].iloc[-1] / df["Close"].iloc[-21] - 1) * 100, 2)
@@ -202,7 +234,6 @@ def compute_diagnostics(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
     if len(df) >= 61:
         ret_60d = round((df["Close"].iloc[-1] / df["Close"].iloc[-61] - 1) * 100, 2)
 
-    # Relative strength vs SPY
     rs_vs_spy_20d = None
     rs_vs_spy_60d = None
     if not spy_df.empty:
@@ -216,7 +247,6 @@ def compute_diagnostics(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
             spy_ret = spy_df["Close"].iloc[-1] / spy_df["Close"].iloc[-61] - 1
             rs_vs_spy_60d = round((stock_ret - spy_ret) * 100, 2)
 
-    # Distance from 52-week high
     distance_52w_high = None
     high52 = last.get("High52W")
     if pd.notna(high52) and float(high52) > 0:
