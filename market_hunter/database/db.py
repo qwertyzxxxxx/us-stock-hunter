@@ -147,7 +147,7 @@ def upsert_signal(scan_run_id: int, signal: dict) -> int:
     cur = conn.cursor()
 
     diagnostics_json = None
-    if signal.get("diagnostics"):
+    if signal.get("diagnostics") is not None:
         try:
             diagnostics_json = json.dumps(signal["diagnostics"])
         except Exception:
@@ -190,6 +190,17 @@ def upsert_signal(scan_run_id: int, signal: dict) -> int:
         )
         row = cur.fetchone()
         signal_id = row["id"] if row else 0
+
+    # Always enrich diagnostics when the caller has richer data (e.g. action_status)
+    # Only overwrites a NULL or less-complete diagnostics column.
+    if diagnostics_json and signal_id:
+        cur.execute(
+            """UPDATE signals
+               SET diagnostics = ?
+               WHERE id = ? AND (diagnostics IS NULL OR diagnostics = '{}')""",
+            (diagnostics_json, signal_id),
+        )
+        conn.commit()
 
     conn.close()
     return signal_id

@@ -231,13 +231,15 @@ def run_us_scan(notify: bool = True) -> dict:
             ep = sig.get("entry_plan") or {}
             if ep:
                 merged_diag.update({
-                    "entry_zone_low": ep.get("entry_zone_low"),
+                    "entry_zone_low":  ep.get("entry_zone_low"),
                     "entry_zone_high": ep.get("entry_zone_high"),
-                    "trigger_price": ep.get("trigger_price"),
-                    "stop_loss": ep.get("stop_loss"),
-                    "target1": ep.get("target1"),
-                    "target2": ep.get("target2"),
-                    "rr_ratio": ep.get("rr_ratio"),
+                    "trigger_price":   ep.get("trigger_price"),
+                    "stop_loss":       ep.get("stop_loss"),
+                    "risk_pct":        ep.get("risk_pct"),
+                    "target1":         ep.get("target1"),
+                    "target2":         ep.get("target2"),
+                    "rr_ratio":        ep.get("rr_ratio"),
+                    "action_status":   ep.get("action_status"),
                 })
             sig["diagnostics"] = merged_diag
 
