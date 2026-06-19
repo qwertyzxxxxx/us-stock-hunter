@@ -6,7 +6,15 @@ Generated: 2026-06-19
 
 ## 1. Can the system be deployed?
 
-**PARTIAL — Run `python main.py scan-us` and `python main.py evaluate-us` to populate data.**
+**YES — Core pipeline is operational.**
+
+| Check | Status |
+|---|---|
+| Scanner runs | ✅ 53 signals in DB |
+| Entry engine | ✅ 16 strategy signals with entry plans |
+| Actionable rate | ✅ 88% of strategy signals are 可关注买点 |
+| Telegram | ✅ Chinese output with entry/exit levels |
+| Backtest data | ⚠️ Need 20+ trading days of signal history for full backtest |
 
 ---
 
@@ -33,13 +41,13 @@ Run `evaluate-us` for 20+ days to identify underperforming strategies.
 | Metric | Value |
 |---|---|
 | Total signals in DB | 53 |
-| Strategy signals (with entry plan) | 0 |
-| ✅ Actionable (可关注买点) | 0 (0%) |
+| Strategy signals (with entry plan) | 16 |
+| ✅ Actionable (可关注买点) | 14 (88%) |
 | ⚠️ Observation | 0 |
 | ❗ High risk | 0 |
-| Avg RR ratio | N/A |
-| Avg risk % | N/A% |
-| Avg volume ratio | N/Ax |
+| Avg RR ratio | 2.25 |
+| Avg risk % | 4.60% |
+| Avg volume ratio | 1.99x |
 
 ---
 
@@ -47,14 +55,14 @@ Run `evaluate-us` for 20+ days to identify underperforming strategies.
 
 | Sector | Signals | Win Rate 20D | Avg 20D | PF |
 |---|---|---|---|---|
-| 公用事业 | 1 | N/A |   N/A   | N/A |
-| 信息技术 | 1 | N/A |   N/A   | N/A |
-| 房地产 | 1 | N/A |   N/A   | N/A |
-| 材料 | 1 | N/A |   N/A   | N/A |
 | 信息技术 | 17 | N/A |   N/A   | N/A |
+| 金融 | 13 | N/A |   N/A   | N/A |
 | 工业 | 10 | N/A |   N/A   | N/A |
 | 医疗健康 | 5 | N/A |   N/A   | N/A |
-| 金融 | 13 | N/A |   N/A   | N/A |
+| 可选消费 | 3 | N/A |   N/A   | N/A |
+| 日常消费 | 1 | N/A |   N/A   | N/A |
+| 材料 | 1 | N/A |   N/A   | N/A |
+| 房地产 | 1 | N/A |   N/A   | N/A |
 
 ---
 
