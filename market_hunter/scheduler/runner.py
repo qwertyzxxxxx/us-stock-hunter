@@ -14,6 +14,21 @@ def _scan_job():
         logger.info(f"Scheduled scan complete — {results.get('total_signals', 0)} signals")
     except Exception as e:
         logger.error(f"Scheduled scan failed: {e}", exc_info=True)
+        results = {}
+
+    # Paper fund daily run (after scan, same trading day)
+    try:
+        from datetime import date
+        from market_hunter.paper_fund.fund import run_daily
+        from market_hunter.paper_fund.db import get_fund
+        if get_fund():  # only run if fund has been initialized
+            scan_date = date.today().isoformat()
+            run_daily(scan_date, scan_results=results, notify=True)
+            logger.info("Paper fund daily run complete")
+        else:
+            logger.info("Paper fund not initialized — skipping paper-daily step")
+    except Exception as e:
+        logger.error(f"Paper fund daily run failed: {e}", exc_info=True)
 
 
 def start_scheduler():

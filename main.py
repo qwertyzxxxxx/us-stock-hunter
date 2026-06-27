@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-market-hunter — US Stock Daily Scanner
+market-hunter — US Stock Daily Scanner + Paper Fund
 Usage:
   python main.py scan-us          Run the US stock scan now
   python main.py evaluate-us      Evaluate historical signal returns
@@ -11,6 +11,9 @@ Usage:
   python main.py best-signals     Top 20 best trades ever
   python main.py quality-report   Signal quality / actionability report
   python main.py readiness        Generate PRODUCTION_READINESS.md
+  python main.py paper-init       Initialize paper fund ($100,000)
+  python main.py paper-daily      Run paper fund daily (no scan)
+  python main.py paper-report     Send paper fund Telegram report
 """
 import sys
 import logging
@@ -162,18 +165,63 @@ def cmd_readiness():
     print(f"✅ PRODUCTION_READINESS.md written to {path}\n")
 
 
+# ─── Paper Fund commands ──────────────────────────────────────────────────────
+
+def cmd_paper_init():
+    """Initialize paper fund with $100,000. Safe to call multiple times."""
+    from market_hunter.paper_fund.fund import init_fund
+    fund = init_fund()
+    print(f"\n✅ Paper Fund initialized")
+    print(f"   Initial capital : ${fund['initial_capital']:,.2f}")
+    print(f"   Current cash    : ${fund['current_cash']:,.2f}")
+    print(f"   Created         : {fund.get('created_at', 'N/A')}\n")
+
+
+def cmd_paper_daily():
+    """Run paper fund daily processing without a live scan (uses DB state only)."""
+    from datetime import date
+    from market_hunter.paper_fund.fund import run_daily
+    scan_date = date.today().isoformat()
+    print(f"\n📂 Running paper fund daily (standalone) — {scan_date}\n")
+    activity = run_daily(scan_date, scan_results=None, notify=True)
+    if "error" in activity:
+        print(f"❌ {activity['error']}")
+        return
+    eq = activity.get("equity") or {}
+    print(f"✅ Done")
+    print(f"   Total equity    : ${eq.get('total_equity', 0):,.2f}")
+    print(f"   Cash            : ${eq.get('cash', 0):,.2f}")
+    print(f"   Position value  : ${eq.get('position_value', 0):,.2f}")
+    print(f"   Cumulative PnL  : {eq.get('pnl_cumulative_pct', 0):+.1f}%")
+    print(f"   Open positions  : {len(activity.get('positions', []))}")
+    print(f"   Pending orders  : {len(activity.get('pending', []))}\n")
+
+
+def cmd_paper_report():
+    """Send paper fund Telegram report from current DB state."""
+    from datetime import date
+    from market_hunter.paper_fund.reporter import send_paper_report_standalone
+    scan_date = date.today().isoformat()
+    print(f"\n📤 Sending paper fund report — {scan_date}\n")
+    ok = send_paper_report_standalone(scan_date)
+    print("✅ Report sent\n" if ok else "❌ Report failed — check Telegram config\n")
+
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 
 COMMANDS = {
-    "scan-us":       cmd_scan,
-    "evaluate-us":   cmd_evaluate,
-    "report-us":     cmd_report,
-    "schedule":      cmd_schedule,
-    "performance":   cmd_performance,
-    "sector-report": cmd_sector_report,
-    "best-signals":  cmd_best_signals,
+    "scan-us":        cmd_scan,
+    "evaluate-us":    cmd_evaluate,
+    "report-us":      cmd_report,
+    "schedule":       cmd_schedule,
+    "performance":    cmd_performance,
+    "sector-report":  cmd_sector_report,
+    "best-signals":   cmd_best_signals,
     "quality-report": cmd_quality_report,
-    "readiness":     cmd_readiness,
+    "readiness":      cmd_readiness,
+    "paper-init":     cmd_paper_init,
+    "paper-daily":    cmd_paper_daily,
+    "paper-report":   cmd_paper_report,
 }
 
 
