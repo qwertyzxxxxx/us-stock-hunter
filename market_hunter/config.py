@@ -27,3 +27,11 @@ SCHEDULER_MINUTE_MY = 30
 SCHEDULER_TZ = "Asia/Kuala_Lumpur"
 
 DB_PATH = os.getenv("DB_PATH", "market_hunter.db")
+
+# Cooldown periods per strategy (calendar days).
+# During cooldown: signal is saved to DB but NOT sent to Telegram again.
+COOLDOWN_DAYS: dict[str, int] = {
+    "ma60_reclaim": 15,
+    "strong_trend": 10,
+    "new_high":     20,
+}

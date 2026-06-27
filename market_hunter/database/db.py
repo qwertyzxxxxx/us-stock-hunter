@@ -1,7 +1,8 @@
 import json
 import sqlite3
 import logging
-from market_hunter.config import DB_PATH
+from datetime import date as _date
+from market_hunter.config import DB_PATH, COOLDOWN_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,27 @@ def init_db():
         max_drawdown REAL,
         max_gain REAL,
         evaluated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- V1.2: Telegram push tracking (re-push deduplication)
+    CREATE TABLE IF NOT EXISTS signal_push_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        strategy_name TEXT NOT NULL,
+        signal_date TEXT NOT NULL,
+        action_status TEXT,
+        total_score REAL,
+        pushed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(symbol, strategy_name, signal_date)
+    );
+
+    -- V1.2: Paper fund holdings filter (Part 5 / Part 8 preparation)
+    CREATE TABLE IF NOT EXISTS paper_holdings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL UNIQUE,
+        added_date TEXT,
+        notes TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     """)
     conn.commit()
@@ -191,8 +213,7 @@ def upsert_signal(scan_run_id: int, signal: dict) -> int:
         row = cur.fetchone()
         signal_id = row["id"] if row else 0
 
-    # Always enrich diagnostics when the caller has richer data (e.g. action_status)
-    # Only overwrites a NULL or less-complete diagnostics column.
+    # Enrich diagnostics when caller has richer data (e.g. action_status)
     if diagnostics_json and signal_id:
         cur.execute(
             """UPDATE signals
@@ -216,6 +237,106 @@ def insert_strategy_result(signal_id: int, strategy_name: str, symbol: str,
            (signal_id, strategy_name, symbol, signal_date, rank_in_strategy, details, reason)
            VALUES (?,?,?,?,?,?,?)""",
         (signal_id, strategy_name, symbol, signal_date, rank, details, reason)
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# V1.2 — Cooldown, Holding Filter, Re-Push
+# ---------------------------------------------------------------------------
+
+def is_in_cooldown(symbol: str, strategy_name: str, scan_date: str) -> bool:
+    """
+    True if the same (symbol, strategy) was signalled within the cooldown window.
+    Uses strategy_results to find the last signal date before today.
+    """
+    days = COOLDOWN_DAYS.get(strategy_name, 10)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT MAX(signal_date) FROM strategy_results
+           WHERE symbol = ? AND strategy_name = ? AND signal_date < ?""",
+        (symbol, strategy_name, scan_date),
+    )
+    row = cur.fetchone()
+    conn.close()
+    last_str = row[0] if row else None
+    if not last_str:
+        return False
+    delta = _date.fromisoformat(scan_date) - _date.fromisoformat(last_str)
+    return delta.days < days
+
+
+def is_holding(symbol: str) -> bool:
+    """True if symbol is currently in the paper_holdings table."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM paper_holdings WHERE symbol = ?", (symbol,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def should_push_telegram(
+    symbol: str,
+    strategy_name: str,
+    signal_date: str,
+    action_status: str,
+    total_score: float,
+) -> bool:
+    """
+    True = send to Telegram.  False = DB-only.
+
+    Push when:
+      • First appearance (no prior push record)
+      • action_status changed
+      • score increased by >= 10 points
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT action_status, total_score FROM signal_push_log
+           WHERE symbol = ? AND strategy_name = ? AND signal_date = ?""",
+        (symbol, strategy_name, signal_date),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return True                                   # first appearance
+
+    last_status = row[0]
+    last_score  = float(row[1]) if row[1] is not None else 0.0
+
+    if last_status != action_status:
+        return True                                   # status changed
+
+    if total_score >= last_score + 10:
+        return True                                   # score jumped
+
+    return False
+
+
+def record_push(
+    symbol: str,
+    strategy_name: str,
+    signal_date: str,
+    action_status: str,
+    total_score: float,
+) -> None:
+    """Record (or update) a Telegram push for re-push deduplication."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO signal_push_log
+               (symbol, strategy_name, signal_date, action_status, total_score, pushed_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))
+           ON CONFLICT(symbol, strategy_name, signal_date) DO UPDATE SET
+               action_status = excluded.action_status,
+               total_score   = excluded.total_score,
+               pushed_at     = datetime('now')""",
+        (symbol, strategy_name, signal_date, action_status, total_score),
     )
     conn.commit()
     conn.close()
@@ -296,12 +417,6 @@ def get_scan_runs(limit: int = 20) -> list[dict]:
 
 
 def get_strategy_performance(strategy_name: str = None) -> list[dict]:
-    """
-    Part 8 — Backtest preparation.
-    Compute win rate, average return, and count per strategy from evaluations.
-    A trade is a 'win' if return_20d > 0.
-    Pass strategy_name=None to get all strategies.
-    """
     conn = get_conn()
     cur = conn.cursor()
 
@@ -338,7 +453,7 @@ def get_strategy_performance(strategy_name: str = None) -> list[dict]:
     for r in cur.fetchall():
         d = dict(r)
         eval_cnt = d.get("evaluated_count") or 0
-        wins = d.get("wins") or 0
+        wins     = d.get("wins") or 0
         d["win_rate_pct"] = round(wins / eval_cnt * 100, 1) if eval_cnt > 0 else None
         rows.append(d)
     conn.close()

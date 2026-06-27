@@ -12,7 +12,7 @@ from market_hunter.strategies.ma60_reclaim import check_ma60_reclaim_pullback
 from market_hunter.strategies.strong_trend import check_strong_trend_pullback
 from market_hunter.strategies.new_high import check_new_high_breakout
 from market_hunter.scoring.scorer import compute_total_score, compute_diagnostics
-from market_hunter.entry_engine import compute_entry_plan
+from market_hunter.entry_engine import compute_entry_plan, compute_trade_readiness
 from market_hunter.database import db
 from market_hunter.telegram import notifier
 
@@ -38,11 +38,6 @@ def _build_diagnostics_report(
     strong_signals: list[dict],
     new_high_signals: list[dict],
 ) -> dict:
-    """
-    Part 7 — signal quality diagnostics.
-    Counts by strategy, average score, top sectors.
-    Does NOT modify signal lists.
-    """
     sector_counts: dict[str, int] = {}
     for sig in all_signals:
         s = sig.get("sector") or "其他"
@@ -55,19 +50,19 @@ def _build_diagnostics_report(
     )
 
     return {
-        "ma60_count": len(ma60_signals),
-        "strong_trend_count": len(strong_signals),
-        "new_high_count": len(new_high_signals),
-        "total_signal_count": len(ma60_signals) + len(strong_signals) + len(new_high_signals),
-        "avg_score": round(avg_score, 1),
-        "top_sectors": top_sectors,
+        "ma60_count":          len(ma60_signals),
+        "strong_trend_count":  len(strong_signals),
+        "new_high_count":      len(new_high_signals),
+        "total_signal_count":  len(ma60_signals) + len(strong_signals) + len(new_high_signals),
+        "avg_score":           round(avg_score, 1),
+        "top_sectors":         top_sectors,
     }
 
 
 def run_us_scan(notify: bool = True) -> dict:
     """Run the full US stock daily scan."""
     start_time = time.time()
-    scan_date = date.today().isoformat()
+    scan_date  = date.today().isoformat()
     logger.info(f"Starting US scan — {scan_date}")
 
     db.init_db()
@@ -86,13 +81,13 @@ def run_us_scan(notify: bool = True) -> dict:
     spy_df = get_spy_ohlcv()
     spy_df = compute_indicators(spy_df) if not spy_df.empty else spy_df
 
-    all_signals: list[dict] = []
-    ma60_signals: list[dict] = []
+    all_signals:          list[dict] = []
+    ma60_signals:         list[dict] = []
     strong_trend_signals: list[dict] = []
-    new_high_signals: list[dict] = []
+    new_high_signals:     list[dict] = []
 
-    total_scanned = 0
-    valid_price_count = 0
+    total_scanned           = 0
+    valid_price_count       = 0
     rejected_bad_price_count = 0
 
     for stock in universe:
@@ -121,58 +116,74 @@ def run_us_scan(notify: bool = True) -> dict:
                 continue
 
             valid_price_count += 1
-            total_scanned += 1
+            total_scanned     += 1
 
             sector = stock.get("sector", "")
             scores = compute_total_score(df, spy_df, sector=sector)
-            diag = compute_diagnostics(df, spy_df)
+            diag   = compute_diagnostics(df, spy_df)
 
-            last = df.iloc[-1]
+            last        = df.iloc[-1]
+            close_price = round(float(last["Close"]), 2)
+            vol_ratio   = diag.get("volume_ratio")
+            total_score = scores.get("total_score", 0)
+
             signal_base: dict = {
-                "symbol": symbol,
+                "symbol":       symbol,
                 "company_name": stock.get("companyName", ""),
-                "sector": sector,
-                "industry": stock.get("industry", ""),
-                "market_cap": market_cap,
-                "signal_date": scan_date,
-                "close_price": round(float(last["Close"]), 2),
-                "volume": int(last["Volume"]),
-                "strategies": [],
-                "diagnostics": diag,
+                "sector":       sector,
+                "industry":     stock.get("industry", ""),
+                "market_cap":   market_cap,
+                "signal_date":  scan_date,
+                "close_price":  close_price,
+                "volume":       int(last["Volume"]),
+                "strategies":   [],
+                "diagnostics":  diag,
                 **scores,
             }
 
-            # Strategy A — MA60 Reclaim Pullback
+            # ── Strategy A — MA60 Reclaim Pullback ───────────────────────
             ma60 = check_ma60_reclaim_pullback(df)
             if ma60["triggered"]:
-                signal_base["strategies"].append("ma60_reclaim")
                 ep = compute_entry_plan("ma60_reclaim", df, ma60["details"])
+                ep = compute_trade_readiness(ep, close_price, vol_ratio, total_score,
+                                             "ma60_reclaim")
+                signal_base["strategies"].append("ma60_reclaim")
                 ma60_signals.append({
                     **signal_base,
                     "strategy_details": ma60["details"],
-                    "entry_plan": ep,
+                    "entry_plan":       ep,
+                    "_in_cooldown":     db.is_in_cooldown(symbol, "ma60_reclaim", scan_date),
+                    "_in_holding":      db.is_holding(symbol),
                 })
 
-            # Strategy B — Strong Trend Pullback
+            # ── Strategy B — Strong Trend Pullback ───────────────────────
             strong = check_strong_trend_pullback(df)
             if strong["triggered"]:
-                signal_base["strategies"].append("strong_trend")
                 ep = compute_entry_plan("strong_trend", df, strong["details"])
+                ep = compute_trade_readiness(ep, close_price, vol_ratio, total_score,
+                                             "strong_trend")
+                signal_base["strategies"].append("strong_trend")
                 strong_trend_signals.append({
                     **signal_base,
                     "strategy_details": strong["details"],
-                    "entry_plan": ep,
+                    "entry_plan":       ep,
+                    "_in_cooldown":     db.is_in_cooldown(symbol, "strong_trend", scan_date),
+                    "_in_holding":      db.is_holding(symbol),
                 })
 
-            # Strategy C — New High Breakout
+            # ── Strategy C — 52-Week High Breakout ───────────────────────
             new_high = check_new_high_breakout(df)
             if new_high["triggered"]:
-                signal_base["strategies"].append("new_high")
                 ep = compute_entry_plan("new_high", df, new_high["details"])
+                ep = compute_trade_readiness(ep, close_price, vol_ratio, total_score,
+                                             "new_high")
+                signal_base["strategies"].append("new_high")
                 new_high_signals.append({
                     **signal_base,
                     "strategy_details": new_high["details"],
-                    "entry_plan": ep,
+                    "entry_plan":       ep,
+                    "_in_cooldown":     db.is_in_cooldown(symbol, "new_high", scan_date),
+                    "_in_holding":      db.is_holding(symbol),
                 })
 
             all_signals.append(signal_base)
@@ -181,32 +192,28 @@ def run_us_scan(notify: bool = True) -> dict:
             logger.warning(f"Error processing {symbol}: {e}")
             continue
 
-    # Sort all_signals by score (for Top 20 compact list)
-    all_signals.sort(key=lambda x: x["total_score"], reverse=True)
+    # ── Sort: actionable first, then by score ─────────────────────────────
 
-    # Strategy lists: prioritise actionable (可关注买点) first, then by score.
-    # action_status lives inside entry_plan, computed per strategy signal.
     def _strategy_sort_key(sig: dict) -> tuple:
-        ep = sig.get("entry_plan") or {}
-        status = ep.get("action_status", "观察")
-        is_actionable = 1 if status == "可关注买点" else 0
-        return (is_actionable, sig["total_score"])
+        ep     = sig.get("entry_plan") or {}
+        status = ep.get("action_status") or ""
+        return (1 if status == "可关注买点" else 0, sig["total_score"])
 
+    all_signals.sort(key=lambda x: x["total_score"], reverse=True)
     ma60_signals.sort(key=_strategy_sort_key, reverse=True)
     strong_trend_signals.sort(key=_strategy_sort_key, reverse=True)
     new_high_signals.sort(key=_strategy_sort_key, reverse=True)
 
-    top20 = all_signals[:20]
-    top_ma60 = ma60_signals[:5]
-    top_strong = strong_trend_signals[:5]
+    top20       = all_signals[:20]
+    top_ma60    = ma60_signals[:5]
+    top_strong  = strong_trend_signals[:5]
     top_new_high = new_high_signals[:5]
 
     _enrich_missing_sectors(top20 + top_ma60 + top_strong + top_new_high)
 
-    duration = time.time() - start_time
+    duration     = time.time() - start_time
     total_signals = len(ma60_signals) + len(strong_trend_signals) + len(new_high_signals)
-
-    diag_report = _build_diagnostics_report(
+    diag_report  = _build_diagnostics_report(
         all_signals, ma60_signals, strong_trend_signals, new_high_signals
     )
 
@@ -217,16 +224,25 @@ def run_us_scan(notify: bool = True) -> dict:
         f"NewHigh={len(new_high_signals)}, avg_score={diag_report['avg_score']}"
     )
 
-    # Persist
+    # ── Persist ───────────────────────────────────────────────────────────
+
     run_id = db.insert_scan_run(
         scan_date, total_scanned, total_signals, duration,
         valid_price_count=valid_price_count,
         rejected_bad_price_count=rejected_bad_price_count,
     )
 
-    def _save_signals(signals: list[dict], strategy_name: str) -> None:
+    def _save_signals(signals: list[dict], strategy_name: str) -> list[dict]:
+        """
+        Save all signals to DB. Return only those eligible for Telegram:
+          • action_status == "可关注买点"
+          • not in cooldown
+          • not in holdings
+          • passes re-push deduplication
+        """
+        telegram_eligible: list[dict] = []
         for rank, sig in enumerate(signals, 1):
-            # Merge entry plan into diagnostics before saving
+            # Merge entry plan into diagnostics
             merged_diag = {**(sig.get("diagnostics") or {})}
             ep = sig.get("entry_plan") or {}
             if ep:
@@ -240,12 +256,13 @@ def run_us_scan(notify: bool = True) -> dict:
                     "target2":         ep.get("target2"),
                     "rr_ratio":        ep.get("rr_ratio"),
                     "action_status":   ep.get("action_status"),
+                    "action_reason":   ep.get("action_reason"),
                 })
             sig["diagnostics"] = merged_diag
 
-            sig_id = db.upsert_signal(run_id, sig)
+            sig_id  = db.upsert_signal(run_id, sig)
             details = sig.get("strategy_details", {})
-            reason = notifier._build_reason_text(
+            reason  = notifier._build_reason_text(
                 strategy_name, details, sig.get("diagnostics") or {}
             )
             db.insert_strategy_result(
@@ -253,31 +270,88 @@ def run_us_scan(notify: bool = True) -> dict:
                 str(details), reason,
             )
 
-    _save_signals(top_ma60, "ma60_reclaim")
-    _save_signals(top_strong, "strong_trend")
-    _save_signals(top_new_high, "new_high")
-    for rank, sig in enumerate(top20, 1):
+            # Telegram eligibility — record_push is NOT called here;
+            # it is called only after the Telegram send succeeds (see below).
+            action_status = (sig.get("entry_plan") or {}).get("action_status", "")
+            if (
+                action_status == "可关注买点"
+                and not sig.get("_in_cooldown", False)
+                and not sig.get("_in_holding", False)
+                and db.should_push_telegram(
+                    sig["symbol"], strategy_name, scan_date,
+                    action_status, sig.get("total_score", 0),
+                )
+            ):
+                telegram_eligible.append(sig)
+
+        return telegram_eligible
+
+    tg_ma60    = _save_signals(top_ma60,    "ma60_reclaim")
+    tg_strong  = _save_signals(top_strong,  "strong_trend")
+    tg_new_high = _save_signals(top_new_high, "new_high")
+
+    for sig in top20:
         db.upsert_signal(run_id, sig)
 
+    # ── Filter stats for summary ──────────────────────────────────────────
+
+    def _count_status(slist: list[dict], status: str) -> int:
+        return sum(
+            1 for s in slist
+            if (s.get("entry_plan") or {}).get("action_status") == status
+        )
+
+    all_top = top_ma60 + top_strong + top_new_high
+    filter_stats = {
+        "total_actionable":  _count_status(all_top, "可关注买点"),
+        "total_observation": sum(
+            1 for s in all_top
+            if (s.get("entry_plan") or {}).get("action_status", "").startswith("观察")
+        ),
+        "total_high_risk":   _count_status(all_top, "风险过高，等待回踩"),
+        "cooldown_count":    sum(1 for s in all_top if s.get("_in_cooldown")),
+        "holding_count":     sum(1 for s in all_top if s.get("_in_holding")),
+        "telegram_count":    len(tg_ma60) + len(tg_strong) + len(tg_new_high),
+    }
+
     results = {
-        "scan_date": scan_date,
-        "total_scanned": total_scanned,
-        "total_signals": total_signals,
-        "top20": top20,
-        "ma60_reclaim": top_ma60,
-        "strong_trend": top_strong,
-        "new_high": top_new_high,
+        "scan_date":        scan_date,
+        "total_scanned":    total_scanned,
+        "total_signals":    total_signals,
+        "top20":            top20,
+        # DB-level top5 (all statuses) for reporting
+        "ma60_reclaim":     top_ma60,
+        "strong_trend":     top_strong,
+        "new_high":         top_new_high,
+        # Telegram-eligible (可关注买点 only, cooldown/holding/re-push filtered)
+        "telegram_ma60":    tg_ma60,
+        "telegram_strong":  tg_strong,
+        "telegram_new_high": tg_new_high,
         "duration_seconds": round(duration, 1),
         "summary": {
-            "scanned_count": total_scanned,
-            "valid_price_count": valid_price_count,
-            "rejected_bad_price_count": rejected_bad_price_count,
-            "signal_count": total_signals,
+            "scanned_count":             total_scanned,
+            "valid_price_count":         valid_price_count,
+            "rejected_bad_price_count":  rejected_bad_price_count,
+            "signal_count":              total_signals,
         },
         "diagnostics_report": diag_report,
+        "filter_stats":       filter_stats,
     }
 
     if notify:
         notifier.send_scan_report(scan_date, results)
+        # Record pushes AFTER successful Telegram send (re-push deduplication)
+        for strat_key, tg_list in [
+            ("ma60_reclaim", tg_ma60),
+            ("strong_trend", tg_strong),
+            ("new_high",     tg_new_high),
+        ]:
+            for sig in tg_list:
+                ep     = sig.get("entry_plan") or {}
+                status = ep.get("action_status", "")
+                db.record_push(
+                    sig["symbol"], strat_key, scan_date,
+                    status, sig.get("total_score", 0),
+                )
 
     return results
