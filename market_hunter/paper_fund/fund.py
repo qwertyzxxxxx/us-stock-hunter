@@ -35,11 +35,11 @@ MAX_HOLDING_DAYS = 30
 CANCEL_BUFFER    = 1.02    # cancel order if open > trigger × 1.02
 
 # ── Buy-filter thresholds ────────────────────────────────────────────────────
-BUY_MIN_SCORE  = 85.0
+BUY_MIN_SCORE  = 75.0       # relaxed from 85 — 85 was too strict in current market
 BUY_MIN_RR     = 2.0
-BUY_MAX_RISK   = 6.0
+BUY_MAX_RISK   = 7.0        # relaxed from 6 — allow slightly wider stops
 BUY_MIN_VOL    = 1.2
-BUY_MIN_STARS  = 4          # ★★★★ minimum
+BUY_MIN_STARS  = 3          # relaxed from 4 — ★★★ minimum (可关注买点 earns 3★)
 
 
 # ---------------------------------------------------------------------------
