@@ -69,7 +69,7 @@ def _try_fmp_constituents() -> list[dict]:
         try:
             resp = requests.get(url, params={"apikey": FMP_API_KEY}, timeout=20)
             if resp.status_code == 403:
-                logger.warning(f"FMP {label}: 403 Forbidden — endpoint requires paid plan")
+                logger.info(f"FMP {label}: 403 — paid plan required, using public fallback")
                 return []   # Both endpoints share the same plan gate; stop trying
             resp.raise_for_status()
             data = resp.json()
